@@ -534,11 +534,51 @@ php_label_from_endpoint() {
     fi
     local version
     version="$(php_version_from_label "$endpoint" || true)"
+    [[ -n "$version" ]] || version="$(php_version_from_fpm_pool "$endpoint" || true)"
     if [[ -n "$version" ]]; then
         printf '%s\n' "$version"
     elif [[ "$lower" == *lsphp* ]]; then
         printf '%s\n' "lsphp"
     fi
+}
+
+# Generic socket names (www.sock, 127.0.0.1:9000) carry no version: find the local
+# PHP-FPM pool whose "listen" matches the endpoint and take the version from its path.
+php_version_from_fpm_pool() {
+    local endpoint="$1" target port pool listen
+    if [[ "$endpoint" == *unix:* || "$endpoint" == */*.sock* ]]; then
+        target="${endpoint#*unix:}"
+        target="${target#"${target%%[! ]*}"}"
+        target="${target%%[|\"; ]*}"
+        target="${target#/var}"
+    elif [[ "$endpoint" =~ :([0-9]+) ]]; then
+        port="${BASH_REMATCH[1]}"
+    else
+        return
+    fi
+
+    while IFS= read -r pool; do
+        listen="$(awk -F= '$1 ~ /^[[:space:]]*listen[[:space:]]*$/ { gsub(/[[:space:]"]/, "", $2); print $2; exit }' "$pool" 2>/dev/null)"
+        [[ -n "$listen" ]] || continue
+        if [[ -n "$target" ]]; then
+            [[ "${listen#/var}" == "$target" ]] || continue
+        else
+            [[ "$listen" == "$port" || "$listen" == *":$port" ]] || continue
+        fi
+        if [[ "$pool" =~ ^/etc/php/([0-9]+\.[0-9]+)/ ]]; then
+            printf '%s\n' "${BASH_REMATCH[1]}"
+        elif [[ "$pool" == /etc/php-fpm.d/* ]]; then
+            # RHEL/Fedora system FPM is unversioned: ask the binary.
+            php_binary_version /usr/sbin/php-fpm
+        else
+            php_version_from_label "$pool"
+        fi
+        return
+    done < <(compgen -G '/etc/php/*/fpm/pool.d/*.conf'
+             compgen -G '/etc/php-fpm.d/*.conf'
+             compgen -G '/etc/php*/php-fpm.d/*.conf'
+             compgen -G '/etc/opt/remi/php*/php-fpm.d/*.conf'
+             compgen -G '/opt/cpanel/ea-php*/root/etc/php-fpm.d/*.conf')
 }
 
 find_php_fpm_executable() {
@@ -874,9 +914,11 @@ detect_apache_mod_php() {
     done
 }
 
+# Follows nested includes (e.g. base_api -> base -> fastcgi_pass), bounded by depth.
 resolve_included_fastcgi() {
-    local inc_list="$1" config_file="$2" inc item candidate
+    local inc_list="$1" config_file="$2" depth="${3:-0}" inc item candidate
     local base_dir="${config_file%/*}"
+    ((depth < 5)) || return
     for inc in $inc_list; do
         [[ -n "$inc" ]] || continue
         local check_paths=()
@@ -899,6 +941,15 @@ resolve_included_fastcgi() {
                         printf '%s\n' "$found_pass"
                         return
                     fi
+                    local nested
+                    nested="$(sed -nE 's/^[[:space:]]*include[[:space:]]+([^;[:space:]]+).*/\1/p' "$item" 2>/dev/null | tr '\n' ' ')"
+                    if [[ -n "$nested" ]]; then
+                        found_pass="$(resolve_included_fastcgi "$nested" "$item" $((depth + 1)))"
+                        if [[ -n "$found_pass" ]]; then
+                            printf '%s\n' "$found_pass"
+                            return
+                        fi
+                    fi
                 fi
             done
         done
@@ -908,7 +959,7 @@ resolve_included_fastcgi() {
 # OpenLiteSpeed / LiteSpeed native configuration: domains come from listener
 # maps and template members; each vhost (or template, or the server) names a
 # PHP script handler whose extprocessor path is the lsphp binary.
-# Prints: domain <TAB> lsphp path <TAB> configuration file.
+# Prints: domain, lsphp path, configuration file (\x1f-separated).
 collect_litespeed_records() {
     local conf_dir="${1%/}"
     awk -v root="${conf_dir%/conf}" -v main="$conf_dir/httpd_config.conf" '
@@ -978,7 +1029,7 @@ collect_litespeed_records() {
             n = split(list, names, /[,[:space:]]+/)
             for (i = 1; i <= n; i++)
                 if (names[i] != "" && names[i] != "*" && names[i] !~ /\$/)
-                    print names[i] "\t" path "\t" file
+                    print names[i] "\037" path "\037" file
         }
         BEGIN {
             parse(main, "")
@@ -1090,7 +1141,7 @@ scan_configs() {
                     n = split(names, fields, /[[:space:]]+/)
                     for (i = 1; i <= n; i++)
                         if (fields[i] != "" && fields[i] != "_" && fields[i] !~ /\$/)
-                            print fields[i] "\t" endpoint "\t" includes
+                            print fields[i] "\037" endpoint "\037" includes
                     block = ""
                 }
                 {
@@ -1156,7 +1207,7 @@ scan_configs() {
                             n = split(names, fields, /[[:space:]]+/)
                             for (i = 1; i <= n; i++)
                                 if (fields[i] != "" && fields[i] !~ /\$/)
-                                    print fields[i] "\t" endpoint "\t" ""
+                                    print fields[i] "\037" endpoint "\037" ""
                             in_vhost = 0
                             apache = ""
                         }
@@ -1166,7 +1217,7 @@ scan_configs() {
                     if (in_server) flush_nginx()
                 }
             ' "$config" |
-                while IFS=$'\t' read -r domain endpoint includes; do
+                while IFS=$'\x1f' read -r domain endpoint includes; do
                     [[ -n "$domain" ]] || continue
                     if [[ -z "$endpoint" && -n "$includes" ]]; then
                         local resolved_inc
@@ -1178,7 +1229,7 @@ scan_configs() {
                         upstream_target="$(resolve_upstream_endpoint "$endpoint")"
                         [[ -n "$upstream_target" ]] && endpoint="$upstream_target"
                     fi
-                    printf '%s\t%s\t%s\n' "$domain" "$endpoint" "$config"
+                    printf '%s\x1f%s\x1f%s\n' "$domain" "$endpoint" "$config"
                 done >> "$records_file"
         done < <(
             find "$directory" \
@@ -1189,7 +1240,7 @@ scan_configs() {
     done
 
     ui_color_enabled && printf '\n'
-    while IFS=$'\t' read -r domain endpoint source; do
+    while IFS=$'\x1f' read -r domain endpoint source; do
         [[ -n "$domain" ]] || continue
         if [[ ${scan_domain_seen[$domain]+present} ]]; then
             continue
@@ -1204,7 +1255,7 @@ scan_configs() {
         return 0
     fi
     echo "  Detected $total unique domain(s); checking PHP runtime settings..."
-    while IFS=$'\t' read -r domain endpoint source; do
+    while IFS=$'\x1f' read -r domain endpoint source; do
         [[ -n "$domain" ]] || continue
         label="$(php_label_from_endpoint "$endpoint" || true)"
         path_hint="$(php_path_from_endpoint "$endpoint" || true)"
